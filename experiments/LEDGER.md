@@ -9,10 +9,21 @@ between two single runs are not evidence. Organizers keep the best practice scor
 | # | Bot | Commit (repo `akshayagg18/mech-royale`, `main`) | Config | Official practice score / rank | Source |
 | --- | --- | --- | --- | --- | --- |
 | S1 | ghost-v1 | `e3fbf795f27857c141b6b06eb2e054e88af9b5f7` | n/a (no `CFG`) | **2.48, rank 77 of 103** at submission (leader 5.25, baseline 1.15, average place about 13.52 of 16) | Reported by the user in the mission brief of Sat 2026-11-21 10:44 SGT. I did not make this submission and hold no receipt or submission id. |
-| S2 | ghost-v2 | filled in below once pushed | defaults in `ghost_bot.CFG` (FARM on, OPP off, RECOVER on, DROP_REACH 260, SOUND_AIM on) | **not submitted by me; no official result** | see the report |
+| S2 | ghost-v2 | `f0b1fb308da49c4d79cd563ea8501c252cf47325` | defaults in `ghost_bot.CFG` (FARM on, OPP off, RECOVER on, DROP_REACH 260, SOUND_AIM on) | **3.31** (v1 2.48 -> +0.83) | Reported as the verified official v2 score in the Ghost-v3 brief of Sat 2026-11-21 12:59 SGT. I made no submission and hold no receipt or submission id. |
+| S3 | ghost-v3 | see "Ghost-v3 candidates" below | v3 defaults in `ghost_bot.CFG` (each change is a flag) | **not submitted by me; no official result** | the user submits through the portal |
 
 The commit hash for S2 is recorded in `FIRST_SUBMISSION_REPORT.md` (section "What to publish") and in the final message; it
 cannot be written into the commit it describes.
+
+## Ghost-v3 candidates
+
+| Candidate | Commit | Flags that differ from the v2 behaviour | Local evidence (my simulator, not official) | Official score |
+| --- | --- | --- | --- | --- |
+| v3.0 | the commit that follows `f0b1fb3` on `main` (hash given in the hand-over message; a commit cannot contain its own hash) | `AIM_SPLIT, TURN_AWARE, LASER_HOLD, TRUST_OBS, DODGE_GUN, FARM_EFF, FARM_PLAN, QUIET_RETREAT` on; `ENGAGE="ev"`, `EV_MIN=0.0`, `DEATH_COST=2.0`, `EV_RANGE=110`, `EV_RECOVER_GATE` on; `THREAT_HIDE, QUIET_FARM, THREAT_FARM, SCAN360, EDGE_W, CHOKE_W` off; `UPG="damage"` | +0.52 +- 0.21 vs v2 on 96 seeds (4.76 vs 4.24); +0.39 on diff 3; +0.12 with omniscient vision | **none yet** - to be entered from the portal result |
+
+Follow-up submissions (one change each, read the result first): S4 = v3.0 with `ENGAGE="off"` (isolates the EV engagement, the only change the
+simulator supports), S5 = v3.0 with `TRUST_OBS=False` (the only priority-1 change with a stated downside), then re-enable `THREAT_HIDE` or `QUIET_FARM` only if the
+official score argues for it.
 
 ## What changed between S1 and S2 (each line is a separate `CFG` flag unless noted)
 

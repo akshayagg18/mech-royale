@@ -969,6 +969,15 @@ def make_sync(base):
 _NAV = {}
 
 
+def _parse_cfg_value(v):
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    try:
+        return float(v)
+    except ValueError:
+        return v                      # string-valued keys (UPG, ENGAGE)
+
+
 def run_one(args):
     map_dir, botmod, seed, know, seconds, diff, cfgover = args
     cfg = load_config()
@@ -980,7 +989,7 @@ def run_one(args):
     if cfgover and hasattr(mod, "CFG"):
         for kv in cfgover.split(","):
             k, v = kv.split("=")
-            mod.CFG[k] = (v.lower() == "true") if v.lower() in ("true", "false") else float(v)
+            mod.CFG[k] = _parse_cfg_value(v)
     Bot = make_sync(mod.Ghost)
     arena = Arena(nav, cfg, seed, know, diff=diff)
     hello = {"type": "hello", "protocol": "mechfight/1", "slot": arena.ours.id, "seed": 12345 + seed,
