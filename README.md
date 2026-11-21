@@ -1,53 +1,60 @@
-# ghost-v1: a survival-first Mech Royale bot
+# ghost-v2: a Mech Royale bot that builds up, then fights on its own terms
 
-A `mechfight/1` bot for the Builders Buildathon 2026 Mech Royale track. Python 3, **standard library only**,
-built on the official `mechfight.py` wrapper (copied verbatim).
+A `mechfight/1` bot for the Builders Buildathon 2026 Mech Royale track. Python 3, **standard library only**, built on
+the official `mechfight.py` wrapper (copied verbatim). `ghost-v1` (survival-first, scored 2.48 in practice) is kept
+unchanged in `baseline/ghost_bot_v1.py` for A/B comparison.
 
-Scoring is placement by death order, so this bot optimises *staying alive* and picks fights only when it has to:
+Scoring is placement by death order against coordinated house bots that hunt the weakest team first, so v2 keeps v1's
+zone discipline and navigation but stops being the weakest target:
 
-* **Zone first.** Stays inside the *next* safe circle. Because a shrinking circle always contains the next one, being
-  inside it means zero zone damage. Planned paths are zone-aware (soft cost outside the circle, a hard "stay inside"
-  re-plan when the cheapest route would leave it), and hiding spots are taken from the largest connected region of the
-  next circle so later circles stay reachable (cliffs, buildings and rivers can split a circle).
-* **Real navigation.** Rasterises `world.json` prisms and `terrain.i16` slopes into a 4 m grid (map loaded in a worker
-  thread, ~0.2 s), Dijkstra with a clearance cost, string-pulled paths, pure-pursuit following, stuck detection that
-  learns blocked cells.
-* **Hide, don't hunt.** Picks low-exposure cells (line-of-sight rays) inside the next circle, idles there (no noise,
-  armour facing the last threat, regen after 5 s without damage), and moves again when the zone says so. When calm and
-  early enough it walks below the 5 m/s footstep threshold (silent) and only sprints when the schedule demands it.
-* **Selective combat.** Fires only when provoked, when something is within 50 m, or to finish a weak mech. Strafes,
-  keeps its front arc toward the target (rear armour is x1.5), dodges mortar shells and laser charges, and breaks off
-  to cover below 35% HP.
-* **Opportunistic loot.** Supply drops when uncontested, nearby laser/lightning pickups and cubes inside the safe zone,
-  upgrade offers via a fixed priority list.
+* **Zone first (unchanged).** Stays inside the *next* safe circle (zero zone damage), zone-aware Dijkstra on a 4 m grid
+  rasterised from `world.json` / `terrain.i16`, low-exposure hiding cells from the largest connected region.
+* **Build up while calm.** Breaks crates, shoots drones, collects cubes, and walks to laser/lightning pickups (90 m) and
+  supply drops (260 m) when no enemy is within 100 m and HP is above 55%. Crates and drones only in the first 200 s.
+* **Controlled engagement.** Fights when provoked, when an enemy is within 55 m, or to finish a weak target; picks its
+  range from the loadout (lightning 24 m, laser 80 m, gun 48 m), leads shots, holds and releases laser charges, and
+  never starts a charge with a second enemy close.
+* **Retreat and recovery.** Retreat threshold 28% HP, plus 7% per additional close enemy, unless it is winning on kill time;
+  breaks contact (no firing) when the enemy is out of reach, keeps shooting while backing away when it is not.
+* **Zone-aware duels.** Duel movement is pushed back toward the next circle near its rim.
+* **Sounds.** Faces gunfire when standing still.
+
+Every behaviour above is a flag or number in the `CFG` dict at the top of `ghost_bot.py`, so official runs can change one
+thing at a time (see `experiments/LEDGER.md`).
 
 ## Layout
 
 | Path | What |
 | --- | --- |
 | `Dockerfile` | python:3.13-slim, copies the three modules, entrypoint `ghost_bot.py` |
-| `ghost_bot.py` | the bot (decisions, combat, planning requests) |
+| `ghost_bot.py` | ghost-v2 (decisions, farming, combat, planning requests) |
 | `nav.py` | map rasterisation, Dijkstra, line of sight, exposure, zone penalty, connected components |
 | `mechfight.py` | official wrapper, unmodified |
-| `tests/` | kinematic simulator (`sim.py`) and a synthetic-map generator; not the real game |
+| `baseline/ghost_bot_v1.py` | the frozen v1 bot (commit `e3fbf79`) |
+| `tests/test_v2.py` | 32 decision tests on the real map (farming, fights, retreat, zone push, drops, protocol edge cases, latency) |
+| `tests/arena_sim.py` | 16-mech squad-hunt simulator on the real arena; `--bot ghost_bot_v1` / `ghost_bot`, `--cfg KEY=VAL` |
+| `tests/sim.py` | kinematic zone-survival simulator |
+| `experiments/` | `ROOT_CAUSE_ANALYSIS.md`, `LEDGER.md`, simulator results |
 | `docs/research.md` | verified facts vs hypotheses from the rules and protocol |
 
 ## Checking it
 
 ```sh
 # protocol conformance (needs the official kit's check/ directory)
-python3 check/check.py -- python3 -u ghost_bot.py
+python3 check/check.py --map-dir arena -- python3 -u ghost_bot.py
 docker build -t ghost .
 python3 check/check.py --map-dir /arena -- docker run --rm -i --network none --cpus 1 --memory 512m --read-only \
     --tmpfs /tmp:rw,size=64m --user 65534:65534 -v "$PWD/arena:/arena:ro" ghost
 
-# zone-survival simulation on the real arena (arena/v2/{world.json,terrain.i16} from the kit)
-python3 tests/sim.py --map path/to/arena --seed 1 --seconds 420
-python3 tests/sim.py --map path/to/arena --seed 1 --seconds 420 --chaos --enemies 5   # exercises combat paths
+# decision tests (real map from the kit)
+python3 tests/test_v2.py --map path/to/mechfight-kit/arena
+
+# v1 vs v2 in the squad-hunt simulator (a model I wrote, NOT the real game: noise is about 0.5 points)
+python3 tests/arena_sim.py --map path/to/arena --bot ghost_bot_v1 --seeds 1-24 --know omni --diff 2
+python3 tests/arena_sim.py --map path/to/arena --bot ghost_bot    --seeds 1-24 --know omni --diff 2
 ```
 
-The simulator models walking, collisions, the zone and a few scripted enemies; it exists to catch navigation and
-zone-handling bugs, not to predict match results.
+The simulators exist to catch bugs and rule out ideas that clearly hurt. They cannot predict the official score.
 
 ## License
 

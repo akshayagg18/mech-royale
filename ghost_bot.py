@@ -1,4 +1,11 @@
-"""Ghost: a survival-first bot for Builders Mech Royale (protocol mechfight/1).
+"""Ghost-v2: a resource-and-survival bot for Builders Mech Royale (protocol mechfight/1).
+
+v2 = v1 (zone-safe pathing, concealed hide spots, stealth walking, dodging) plus: crate / drone / cube / weapon
+farming early, a utility-based duel engine (engage when we win the damage race or are forced, hold the weapon-specific
+range, strafe, stay inside the zone), a dynamic retreat-and-recover rule, and duel-oriented upgrade picks.
+Every behaviour has a switch in CFG so an official submission can change one factor at a time.
+
+v1 notes (still true):
 
 Placement is all that scores, so Ghost tries to be the last one anybody finds:
 
@@ -35,10 +42,28 @@ except Exception:  # pragma: no cover - the bot still plays (blind) if the map c
     mf.log(traceback.format_exc())
 
 TAU = 2 * math.pi
-UPGRADE_ORDER = ["nanites", "armor", "plating", "sensors", "gun_damage", "servos", "laser_damage",
-                 "gyros", "gun_rate", "reactor", "capacitor", "jets", "laser_charge", "gun_velocity",
-                 "gun_mag", "lightning_efficiency", "lightning_range", "lightning_chain",
-                 "laser_pierce"]
+
+CFG = dict(
+    FARM=True,           # seek crates / drones / cubes / weapons while calm
+    FARM_UNTIL=200.0,    # crates and drones only before this match time (cubes and weapons any time)
+    FARM_HP=0.55,        # do not farm below this HP fraction
+    FARM_STAND=30.0,     # firing distance for crates and drones
+    OPP=False,           # opportunistic engagement of visible enemy mechs when the damage race favours us
+    OPP_RANGE=105.0,
+    OPP_MAXN=2,          # at most this many enemy mechs within 115 m for an opportunistic fight
+    FAVOR=0.9,           # time-to-kill < FAVOR * time-to-die
+    CLOSE=55.0,          # any enemy mech this close is fought (it will catch us anyway)
+    RETREAT=0.28,        # HP fraction below which we disengage (+0.07 per extra enemy) unless winning
+    RECOVER=True,        # break line of sight and regenerate instead of trading to the death
+    ZONE_BUF=14.0,       # keep this margin inside the circle that will exist in 4 s while fighting
+    RECOVER_RANGE=90.0,  # below the retreat threshold: farther than this we just break contact; closer we shoot while backing off
+    CALM_R=100.0,        # farm only when no enemy mech is visible within this range
+    DROP_REACH=260.0,    # supply drops: go for any drop we can reach before it lands + a few seconds
+    SOUND_AIM=True,      # turn the torso toward heard gun/laser/step sounds when standing still (wider sight wedge)
+)
+UPGRADE_ORDER = ["gun_damage", "plating", "armor", "gun_rate", "nanites", "laser_damage", "laser_charge",
+                 "lightning_efficiency", "gyros", "sensors", "gun_mag", "servos", "gun_velocity", "lightning_range",
+                 "lightning_chain", "reactor", "capacitor", "jets", "laser_pierce"]
 
 
 def zof(pos, default):
@@ -64,7 +89,7 @@ def norm2(x: float, y: float):
 
 
 class Ghost:
-    name = "ghost-v1"
+    name = "ghost-v2"
 
     def __init__(self, hello):
         sys.setswitchinterval(0.001)
@@ -105,6 +130,11 @@ class Ghost:
         self._t = 0.0
         self.mode = "boot"
         self.laser_hold = 0.0
+        self.snd = None           # (t, bearing, dist band, kind) of the latest relevant sound
+        self.fight_id = None
+        self.cmode = "none"
+        self.recover_until = 0.0
+        self.ft = None            # current farm target {"id","best","since","kind","shooting"}
         threading.Thread(target=self._boot, daemon=True).start()
 
     # ------------------------------------------------------------------ worker thread
@@ -451,6 +481,10 @@ class Ghost:
             elif ty == "took":
                 self.loot = None
 
+        for sd in obs.get("sounds", []):
+            if sd.get("kind") in ("gun", "laser", "laser_charge", "lightning", "step", "boost", "jet", "mortar") and sd.get("age", 9.0) < 0.8:
+                self.snd = (t, sd.get("bearing", 0.0), sd.get("dist", "far"), sd["kind"])
+
         # ---- adopt a finished plan
         pn = self.plan_new
         if pn is not None:
@@ -536,34 +570,27 @@ class Ghost:
         if gdx or gdy:
             gdx, gdy = self._steer(x, y, gdx, gdy)
 
-        # ---- target selection (self-defence / finishing blow)
-        fight = None
-        for e in enemies:
-            if not e["_vis"] or e["_dh"] > 140:
-                continue
-            provoked = (t - self.last_hit_by.get(e["id"], -99.0) < 4.0) or e["_dh"] < 50.0
-            weak = e.get("hp") is not None and e.get("max_hp") and e["hp"] <= 0.3 * e["max_hp"] and e["_dh"] < 120
-            if provoked or weak:
-                fight = e
-                break
-        if fight is None and t - self.last_npc_hit < 4.0:
-            for n in npcs:
-                if n["_vis"] and n["_dh"] < 60:
-                    fight = n
-                    break
+        # ---- threats: decide whether (and whom) to fight
+        fight, cmode = self._choose_fight(me, enemies, npcs, t)
+        self.cmode = cmode
+        vis_enemies = [e for e in enemies if e["_vis"] and e["_dh"] < CFG["CALM_R"]]
 
         # ---- dodge
         dodge = self._incoming_dodge(obs, me, enemies, t)
 
-        # ---- loot / drop (only when calm)
-        calm = fight is None and not any(e["_vis"] and e["_dh"] < 90 for e in enemies) \
-            and t - self.last_damage_t > 3.0 and dodge is None
+        # ---- calm? then farm resources / loot / supply drop
+        calm = fight is None and not vis_enemies and t - self.last_damage_t > 3.0 and dodge is None and cmode != "recover"
         ldx = ldy = 0.0
         loot_active = False
+        farm = None
         if calm and t < 380 and in_zone:
-            loot_active, ldx, ldy = self._loot(obs, me, nc, nr, drop, t, x, y)
+            if CFG["FARM"] and drop is None:
+                farm = self._farm(obs, me, npcs, nc, nr, t, x, y)
+            if farm is None:
+                loot_active, ldx, ldy = self._loot(obs, me, nc, nr, drop, t, x, y)
         else:
             self.loot = None
+            self.ft = None
 
         # ---- compose movement
         mx, my = gdx, gdy
@@ -574,12 +601,30 @@ class Ghost:
         if loot_active:
             mx, my = ldx, ldy
             self.mode = "loot"
+        if farm is not None:
+            mx, my, aim_yaw, aim_pitch, fire = farm["mx"], farm["my"], farm["yaw"], farm["pitch"], farm["fire"]
+            self.mode = "farm"
         if fight is not None:
-            mx, my, aim_yaw, aim_pitch, fire, flee = self._combat(obs, me, fight, (gdx, gdy), (cx, cy, cr), t, act)
-            self.mode = "flee" if flee else "fight"
+            mx, my, aim_yaw, aim_pitch, fire, flee = self._duel(obs, me, fight, enemies, (gdx, gdy), t, cmode)
+            self.mode = "flee" if flee else "duel"
             boost = flee and me["energy"] > 30
-        elif t - self.last_damage_t < 3.0 and self.last_bearing is not None:
-            aim_yaw = self.last_bearing          # face where it came from (rear armor)
+        else:
+            nearest = enemies[0] if enemies and enemies[0]["_vis"] and enemies[0]["_dh"] < 130 else None
+            if nearest is not None:
+                aim_yaw = math.atan2(nearest["pos"][1] - y, nearest["pos"][0] - x)     # face it (rear armor)
+                if cmode == "recover":
+                    cov = self._cover_dir(x, y, nearest["pos"][0], nearest["pos"][1], cx, cy, cr)
+                    if cov:
+                        mx, my = cov[0] * 1.2 + gdx * 0.3, cov[1] * 1.2 + gdy * 0.3
+                    else:
+                        ux, uy = norm2(nearest["pos"][0] - x, nearest["pos"][1] - y)
+                        mx, my = gdx * 0.8 - ux * 0.6, gdy * 0.8 - uy * 0.6
+                    boost = me["energy"] > 40
+                    self.mode = "recover"
+            elif t - self.last_damage_t < 3.0 and self.last_bearing is not None:
+                aim_yaw = self.last_bearing          # face where it came from (rear armor)
+            elif CFG["SOUND_AIM"] and self.snd is not None and t - self.snd[0] < 3.0 and not (gdx or gdy):
+                aim_yaw = self.snd[1]                # standing still: look toward the noise (200 m wedge instead of 45 m)
         if dodge is not None:
             mx, my = mx + dodge[0] * 2.0, my + dodge[1] * 2.0
             if dodge[2] and me["energy"] > 25:
@@ -597,7 +642,7 @@ class Ghost:
             self.moving_since = None
         if t < self.jitter_until:
             mx, my = mx + self.jitter[0], my + self.jitter[1]
-        elif (self.mode in ("go", "go*", "zone", "zone-go", "loot", "sneak") and (mx or my) and self.moving_since is not None
+        elif (self.mode in ("go", "go*", "zone", "zone-go", "loot", "sneak", "farm") and (mx or my) and self.moving_since is not None
               and t - self.moving_since >= 2.4 and me.get("grounded", True)):
             old = None
             for (th, hx, hy) in self.hist:           # newest sample that is >= 2.4 s old
@@ -651,7 +696,7 @@ class Ghost:
             mag = w0["stats"].get("mag", 12)
             if w0.get("ammo", mag) <= 0 and w0.get("reload", 0) <= 0:
                 act["reload"] = True
-            elif fight is None and w0.get("ammo", mag) < 0.6 * mag and w0.get("reload", 0) <= 0 and not (mx or my):
+            elif fight is None and not fire[0] and w0.get("ammo", mag) < 0.5 * mag and w0.get("reload", 0) <= 0 and (self.mode != "farm" or w0.get("ammo", mag) <= 3):
                 act["reload"] = True
 
         # ---- take weapons
@@ -683,7 +728,107 @@ class Ghost:
         pitch = math.atan2(pz - oz, math.hypot(px - mx, py - my))
         return yaw, pitch, d
 
-    def _combat(self, obs, me, tgt, goal, circle, t, act):
+    # ------------------------------------------------------------------ combat (utility model)
+    @staticmethod
+    def _enemy_dps(e):
+        """Rough damage per second an enemy mech can put on us (accuracy-discounted)."""
+        cm = 1.0 + 0.04 * min(e.get("cubes", 0) or 0, 10)
+        w = e.get("weapons") or []
+        d = e.get("_dh", 60.0)
+        dps = 187.0 * (0.55 if d < 60 else 0.4)
+        if "lightning" in w and d < 45:
+            dps += 240.0 * 0.7
+        if "laser" in w and d < 220:
+            dps += 131.0 * 0.5
+        if "mortar" in w and d < 160:
+            dps += 120.0 * 0.3
+        return dps * cm
+
+    @staticmethod
+    def _my_dps(me, d):
+        cm = 1.0 + 0.04 * min(me.get("cubes", 0) or 0, 10)
+        ws = me.get("weapons") or []
+        dps = 0.0
+        w0 = ws[0] if ws else None
+        if w0 and w0.get("kind") == "gun":
+            st = w0.get("stats", {})
+            acc = max(0.3, min(0.85, 0.9 - d / 250.0))
+            dps += st.get("damage", 45.0) / max(st.get("cooldown", 0.24), 0.05) * acc
+        w1 = ws[1] if len(ws) > 1 else None
+        if w1:
+            if w1.get("kind") == "lightning" and d < 42:
+                dps += 240.0 * 0.8
+            elif w1.get("kind") == "laser" and d < 250:
+                dps += 131.0 * 0.55
+        return max(dps * cm, 30.0)
+
+    def _choose_fight(self, me, enemies, npcs, t):
+        """Returns (target, mode). mode: none | duel | flee | recover."""
+        hp, mhp = me["hp"], max(me["max_hp"], 1.0)
+        frac = hp / mhp
+        vis = [e for e in enemies if e["_vis"] and e["_dh"] <= 170]
+        near = [e for e in vis if e["_dh"] <= 115]
+        D = sum(self._enemy_dps(e) for e in near)
+        best = None
+        for e in vis:
+            d = e["_dh"]
+            ehp = e.get("hp") or 1400.0
+            emax = e.get("max_hp") or 1400.0
+            provoked = (t - self.last_hit_by.get(e["id"], -99.0)) < 4.0
+            weak = ehp <= 0.3 * emax and d < 130
+            close = d < CFG["CLOSE"]
+            tk = ehp / self._my_dps(me, d)
+            td = hp / max(D, 60.0)
+            fav = tk < CFG["FAVOR"] * td
+            keep = e["id"] == self.fight_id and d <= 140
+            opp = CFG["OPP"] and d <= CFG["OPP_RANGE"] and fav and frac > 0.5 and len(near) <= CFG["OPP_MAXN"]
+            if not (provoked or close or weak or opp or keep):
+                continue
+            score = d - (40 if provoked else 0) - (30 if weak else 0) - (15 if keep else 0)
+            if best is None or score < best[0]:
+                best = (score, e, tk, td, provoked)
+        if best is None:
+            self.fight_id = None
+            if t < self.recover_until and frac < 0.85:
+                return None, "recover"
+            if t - self.last_npc_hit < 4.0:
+                for n in npcs:
+                    if n["_vis"] and n["_dh"] < 60:
+                        return n, "duel"
+            return None, "none"
+        _, e, tk, td, provoked = best
+        thr = CFG["RETREAT"] + 0.07 * max(0, len(near) - 1)
+        winning = tk < 0.5 * td
+        if CFG["RECOVER"] and frac < thr and not winning and e["kind"] == "mech":
+            self.recover_until = t + 7.0
+            if e["_dh"] > CFG["RECOVER_RANGE"]:
+                self.fight_id = None
+                return None, "recover"          # out of its reach: break contact, let the 45 HP/s regeneration run
+            return e, "flee"                    # in its reach: keep shooting while backing toward cover
+        if not CFG["RECOVER"] and frac < 0.35 and e["kind"] == "mech":
+            return e, "flee"
+        self.fight_id = e["id"]
+        return e, "duel"
+
+    def _pref_range(self, me, tgt):
+        ws = me.get("weapons") or []
+        w1 = ws[1] if len(ws) > 1 else None
+        ew = tgt.get("weapons") or []
+        if w1 and w1.get("kind") == "lightning":
+            pref = 24.0
+            if "mortar" in ew:
+                pref = 14.0
+        elif w1 and w1.get("kind") == "laser":
+            pref = 80.0
+            if "lightning" in ew:
+                pref = 70.0
+        else:
+            pref = 48.0
+        if "lightning" in ew and not (w1 and w1.get("kind") == "lightning"):
+            pref = max(pref, 62.0)           # stay out of its 45 m arc
+        return pref
+
+    def _duel(self, obs, me, tgt, enemies, goal, t, cmode):
         x, y, z = me["pos"]
         w = me["weapons"]
         speed = 252.0
@@ -697,6 +842,7 @@ class Ghost:
         perr = abs(apit - pitch)
         tol = max(0.025, min(0.12, math.atan2(2.2, max(dh, 1.0))))
         aligned = yerr < tol and perr < tol * 1.6
+        crowd = sum(1 for e in enemies if e["_vis"] and e["_dh"] < 40)
         fire = [False, False]
         for slot in (0, 1):
             wp = w[slot] if slot < len(w) else None
@@ -712,36 +858,145 @@ class Ghost:
                 full = st.get("charge", 0.75)
                 if ch > 0:
                     fire[slot] = ch < full - 0.05 and yerr < tol * 3        # release at full charge
-                elif wp.get("cooldown", 0) <= 0.05 and dh <= st.get("range", 280) * 0.9 and yerr < tol * 2.5:
+                elif wp.get("cooldown", 0) <= 0.05 and dh <= st.get("range", 280) * 0.9 and yerr < tol * 2.5 and crowd == 0 and dh > 20:
                     fire[slot] = True
             elif kind == "lightning":
                 cone = math.radians(st.get("cone_deg", 30.0)) / 2
-                if dh <= st.get("range", 45) * 0.9 and yerr < cone * 0.6 and me.get("energy", 0) >= 15:
+                if dh <= st.get("range", 45) * 0.92 and yerr < cone * 0.6 and me.get("energy", 0) >= 6:
                     fire[slot] = True
-        # movement: strafe the shooter, drift toward the goal, back off when too close
+        # ---- movement: hold the preferred range, strafe unpredictably, stay inside the zone, keep clear of walls
         ex, ey = tgt["pos"][0] - x, tgt["pos"][1] - y
         ux, uy = norm2(ex, ey)
         if t > self.strafe_until:
             self.strafe_sign = self.rng.choice((-1, 1))
-            self.strafe_until = t + self.rng.uniform(0.8, 1.6)
-        mx, my = -uy * self.strafe_sign * 0.85, ux * self.strafe_sign * 0.85
-        flee = me["hp"] < 0.35 * me["max_hp"] and tgt["kind"] == "mech"
-        if dh < 22:
-            mx -= ux * 0.6
-            my -= uy * 0.6
+            self.strafe_until = t + self.rng.uniform(0.6, 1.5)
+        flee = cmode == "flee"
+        pref = self._pref_range(me, tgt) if tgt["kind"] == "mech" else 30.0
+        radial = max(-1.0, min(1.0, (dh - pref) / 18.0)) * 0.9
         if flee:
-            cov = self._cover_dir(x, y, tgt["pos"][0], tgt["pos"][1], *circle)
+            radial = -0.9
+        tang = self.strafe_sign * 0.9
+        mx, my = ux * radial - uy * tang, uy * radial + ux * tang
+        if flee:
+            cov = self._cover_dir(x, y, tgt["pos"][0], tgt["pos"][1], *self._zplan)
             if cov:
                 mx, my = mx * 0.3 + cov[0] * 1.2, my * 0.3 + cov[1] * 1.2
-            else:
-                mx, my = mx * 0.5 - ux * 0.8 + goal[0] * 0.6, my * 0.5 - uy * 0.8 + goal[1] * 0.6
         else:
-            mx += goal[0] * 0.35
-            my += goal[1] * 0.35
+            mx += goal[0] * 0.2
+            my += goal[1] * 0.2
+        # zone: never fight our way out of the circle that will exist in ~4 s
+        zx, zy, zr = self._zplan
+        marg = zr - math.hypot(x - zx, y - zy)
+        if marg < CFG["ZONE_BUF"]:
+            push = min(1.0, (CFG["ZONE_BUF"] - marg) / CFG["ZONE_BUF"])
+            ix, iy = norm2(zx - x, zy - y)
+            mx += ix * 1.8 * push
+            my += iy * 1.8 * push
         mx, my = self._steer(x, y, mx, my, look=6.0)
         if self.nav is not None and not self.nav.free_ray(x, y, *norm2(mx, my), 6.0):
             self.strafe_sign = -self.strafe_sign
         return mx, my, yaw, pitch, fire, flee
+
+    # ------------------------------------------------------------------ resource farming
+    def _farm(self, obs, me, npcs, nc, nr, t, x, y):
+        """Pick a crate / drone / cube / weapon worth a short detour and return the action for it (or None)."""
+        z = me["pos"][2]
+        ws = me.get("weapons") or []
+        slot1_free = len(ws) > 1 and ws[1] is None
+        if me["hp"] < CFG["FARM_HP"] * me["max_hp"]:
+            self.ft = None
+            return None
+        early = t < CFG["FARM_UNTIL"]
+        cands = []
+
+        def ok_place(p, margin):
+            return math.hypot(p[0] - nc[0], p[1] - nc[1]) < nr - margin and abs(zof(p, z) - z) <= 7.0
+
+        if slot1_free:
+            for p in obs.get("pickups", []):
+                if p["kind"] not in ("lightning", "laser") or self.black.get(p["id"], 0) > t:
+                    continue
+                dh = math.hypot(p["pos"][0] - x, p["pos"][1] - y)
+                if dh <= 90 and ok_place(p["pos"], 8):
+                    val = 7.0 if p["kind"] == "lightning" else 5.5
+                    cands.append((val / (2.0 + dh / 11.0), "pick", p["id"], p["pos"], dh))
+        for c in obs.get("cubes", []):
+            if self.black.get(c["id"], 0) > t:
+                continue
+            dh = math.hypot(c["pos"][0] - x, c["pos"][1] - y)
+            if dh <= (60 if early else 30) and ok_place(c["pos"], 8):
+                cands.append((2.6 / (2.0 + dh / 11.0), "cube", c["id"], c["pos"], dh))
+        if early:
+            for n in npcs:
+                if n["hp"] <= 0 or self.black.get(n["id"], 0) > t or not n["_vis"]:
+                    continue
+                dh = n["_dh"]
+                if dh <= 75 and ok_place(n["pos"], 6):
+                    cands.append((4.4 / (2.0 + dh / 11.0 + 3.0), "npc", n["id"], n["pos"], dh))
+            for c in obs.get("crates", []):
+                if c.get("hp", 0) <= 0 or self.black.get(c["id"], 0) > t:
+                    continue
+                dh = math.hypot(c["pos"][0] - x, c["pos"][1] - y)
+                if dh <= 70 and ok_place(c["pos"], 6) and self.nav is not None and self.nav.los(x, y, c["pos"][0], c["pos"][1]):
+                    val = 3.2 + (1.2 if slot1_free else 0.0)
+                    cands.append((val / (2.0 + dh / 11.0 + 2.6), "crate", c["id"], c["pos"], dh))
+        if not cands:
+            self.ft = None
+            return None
+        cur = self.ft["id"] if self.ft else None
+        best = None
+        for sc, kind, cid, pos, dh in cands:
+            if cid == cur:
+                sc *= 1.5
+            if best is None or sc > best[0]:
+                best = (sc, kind, cid, pos, dh)
+        _, kind, cid, pos, dh = best
+        if self.ft is None or self.ft["id"] != cid:
+            self.ft = {"id": cid, "best": dh, "since": t, "kind": kind}
+        elif dh < self.ft["best"] - 1.5:
+            self.ft["best"], self.ft["since"] = dh, t
+        elif t - self.ft["since"] > (6.0 if kind in ("npc", "crate") else 3.5) and not self.ft.get("shooting"):
+            self.black[cid] = t + 45.0
+            self.ft = None
+            return None
+        ux, uy = norm2(pos[0] - x, pos[1] - y)
+        res = {"mx": 0.0, "my": 0.0, "yaw": math.atan2(pos[1] - y, pos[0] - x), "pitch": 0.0, "fire": [False, False]}
+        stand = CFG["FARM_STAND"]
+        self.ft["shooting"] = False
+        if kind in ("pick", "cube"):
+            if dh > (1.5 if kind == "cube" else 2.6):
+                sx, sy = self._steer(x, y, ux, uy, look=6.0)
+                if self.nav is not None and not self.nav.free_ray(x, y, ux, uy, min(dh, 10.0)) and dh > 6:
+                    pass
+                res["mx"], res["my"] = sx, sy
+            return res
+        # npc / crate: close to firing range with a clear line, then shoot until it breaks
+        tgt = {"kind": "npc" if kind == "npc" else "crate", "pos": pos, "vel": [0, 0, 0]}
+        if kind == "npc":
+            for n in npcs:
+                if n["id"] == cid:
+                    tgt = n
+                    break
+        yaw, pitch, d = self._lead(me, tgt, 252.0)
+        pitch = max(self.min_pitch, min(self.max_pitch, pitch))
+        res["yaw"], res["pitch"] = yaw, pitch
+        los = self.nav.los(x, y, pos[0], pos[1]) if self.nav is not None else True
+        if dh > stand or not los:
+            sx, sy = self._steer(x, y, ux, uy, look=6.0)
+            res["mx"], res["my"] = sx, sy
+        w0 = ws[0] if ws else None
+        ayaw, apit = me["aim"]
+        tol = max(0.03, min(0.12, math.atan2(2.4, max(dh, 1.0))))
+        if los and dh <= 62:
+            if w0 and w0.get("kind") == "gun" and w0.get("ammo", 1) > 0 and w0.get("reload", 0) <= 0 \
+                    and abs(angdiff(ayaw, yaw)) < tol and abs(apit - pitch) < tol * 1.6:
+                res["fire"][0] = True
+                self.ft["shooting"] = True
+            w1 = ws[1] if len(ws) > 1 else None
+            if w1 and w1.get("kind") == "lightning" and dh < 38 and abs(angdiff(ayaw, yaw)) < 0.2 and me.get("energy", 0) > 40:
+                res["fire"][1] = True
+                self.ft["shooting"] = True
+        return res
 
     # ------------------------------------------------------------------ loot
     def _drop_target(self, obs, me, enemies, nc, nr, walk):
@@ -754,7 +1009,7 @@ class Ghost:
                 continue
             px, py = d["pos"][0], d["pos"][1]
             dd = math.hypot(px - x, py - y)
-            if dd > 110 or d["lands_in"] > dd / (walk * 0.85) + 3.0:
+            if dd > CFG["DROP_REACH"] or d["lands_in"] > dd / (walk * 0.85) + 3.0:
                 continue
             if math.hypot(px - nc[0], py - nc[1]) > nr - 6.0:
                 continue
@@ -827,7 +1082,7 @@ class Ghost:
                 continue
             dh = math.hypot(p["pos"][0] - x, p["pos"][1] - y)
             if dh <= 3.6 and abs(zof(p["pos"], z) - z) <= 3.6:
-                score = dh - (3 if p["kind"] == "laser" else 0)
+                score = dh - (6 if p["kind"] == "lightning" else 0)
                 if best is None or score < best[0]:
                     best = (score, p["id"])
         return {"take": best[1]} if best else None

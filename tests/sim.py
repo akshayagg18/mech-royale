@@ -21,6 +21,8 @@ import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
+sys.path.insert(0, os.path.join(HERE, ".."))                      # flat repo layout (bot modules at the root)
+sys.path.insert(0, os.path.join(HERE, "..", "baseline"))        # frozen ghost-v1 (repo layout)
 
 import mechfight as mf  # noqa: E402  (official wrapper, copied verbatim into src/
 from nav import NavMap  # noqa: E402
